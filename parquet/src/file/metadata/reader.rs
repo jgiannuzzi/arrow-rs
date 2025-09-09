@@ -41,7 +41,7 @@ use crate::thrift::{TCompactSliceInputProtocol, TSerializable};
 #[cfg(all(feature = "async", feature = "arrow"))]
 use crate::arrow::async_reader::{MetadataFetch, MetadataSuffixFetch};
 #[cfg(feature = "encryption")]
-use crate::encryption::decrypt::CryptoContext;
+use crate::encryption::decrypt::{ColumnDecryptor, CryptoContext};
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
 
 /// Reads the [`ParquetMetaData`] from a byte stream.
@@ -588,15 +588,16 @@ impl ParquetMetaDataReader {
                 let file_decryptor = metadata.file_decryptor.as_ref().ok_or_else(|| {
                     general_err!("Cannot decrypt column index, no file decryptor set")
                 })?;
+                let column_decryptor = ColumnDecryptor::new(file_decryptor, crypto_metadata)?;
                 let crypto_context = CryptoContext::for_column(
                     file_decryptor,
-                    crypto_metadata,
+                    &column_decryptor,
                     row_group_index,
                     col_index,
                 )?;
-                let column_decryptor = crypto_context.metadata_decryptor();
+                let metadata_decryptor = crypto_context.metadata_decryptor();
                 let aad = crypto_context.create_column_index_aad()?;
-                let plaintext = column_decryptor.decrypt(bytes, &aad)?;
+                let plaintext = metadata_decryptor.decrypt(bytes, &aad)?;
                 decode_column_index(&plaintext, column.column_type())
             }
             None => decode_column_index(bytes, column.column_type()),
@@ -671,15 +672,16 @@ impl ParquetMetaDataReader {
                 let file_decryptor = metadata.file_decryptor.as_ref().ok_or_else(|| {
                     general_err!("Cannot decrypt offset index, no file decryptor set")
                 })?;
+                let column_decryptor = ColumnDecryptor::new(file_decryptor, crypto_metadata)?;
                 let crypto_context = CryptoContext::for_column(
                     file_decryptor,
-                    crypto_metadata,
+                    &column_decryptor,
                     row_group_index,
                     col_index,
                 )?;
-                let column_decryptor = crypto_context.metadata_decryptor();
+                let metadata_decryptor = crypto_context.metadata_decryptor();
                 let aad = crypto_context.create_offset_index_aad()?;
-                let plaintext = column_decryptor.decrypt(bytes, &aad)?;
+                let plaintext = metadata_decryptor.decrypt(bytes, &aad)?;
                 decode_offset_index(&plaintext)
             }
             None => decode_offset_index(bytes),

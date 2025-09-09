@@ -562,11 +562,11 @@ impl<R: ChunkReader> SerializedPageReader<R> {
         let Some(file_decryptor) = parquet_meta_data.file_decryptor() else {
             return Ok(self);
         };
-        let Some(crypto_metadata) = column_chunk_metadata.crypto_metadata() else {
+        let Some(column_decryptor) = column_chunk_metadata.column_decryptor() else {
             return Ok(self);
         };
         let crypto_context =
-            CryptoContext::for_column(file_decryptor, crypto_metadata, rg_idx, column_idx)?;
+            CryptoContext::for_column(file_decryptor, column_decryptor, rg_idx, column_idx)?;
         self.context.crypto_context = Some(Arc::new(crypto_context));
         Ok(self)
     }

@@ -137,41 +137,17 @@ pub(crate) struct CryptoContext {
 impl CryptoContext {
     pub(crate) fn for_column(
         file_decryptor: &FileDecryptor,
-        column_crypto_metadata: &ColumnCryptoMetaData,
+        column_decryptor: &ColumnDecryptor,
         row_group_idx: usize,
         column_ordinal: usize,
     ) -> Result<Self> {
-        let (data_decryptor, metadata_decryptor) = match column_crypto_metadata {
-            ColumnCryptoMetaData::EncryptionWithFooterKey => {
-                // TODO: In GCM-CTR mode will this need to be a non-GCM decryptor?
-                let data_decryptor = file_decryptor.get_footer_decryptor()?;
-                let metadata_decryptor = file_decryptor.get_footer_decryptor()?;
-                (data_decryptor, metadata_decryptor)
-            }
-            ColumnCryptoMetaData::EncryptionWithColumnKey(column_key_encryption) => {
-                let key_metadata = &column_key_encryption.key_metadata;
-                let full_column_name;
-                let column_name = if column_key_encryption.path_in_schema.len() == 1 {
-                    &column_key_encryption.path_in_schema[0]
-                } else {
-                    full_column_name = column_key_encryption.path_in_schema.join(".");
-                    &full_column_name
-                };
-                let data_decryptor = file_decryptor
-                    .get_column_data_decryptor(column_name, key_metadata.as_deref())?;
-                let metadata_decryptor = file_decryptor
-                    .get_column_metadata_decryptor(column_name, key_metadata.as_deref())?;
-                (data_decryptor, metadata_decryptor)
-            }
-        };
-
         Ok(CryptoContext {
             row_group_idx,
             column_ordinal,
             page_ordinal: None,
             dictionary_page: false,
-            data_decryptor,
-            metadata_decryptor,
+            data_decryptor: column_decryptor.data_decryptor(),
+            metadata_decryptor: column_decryptor.metadata_decryptor(),
             file_aad: file_decryptor.file_aad().clone(),
         })
     }
@@ -615,5 +591,62 @@ impl FileDecryptor {
 
     pub(crate) fn file_aad(&self) -> &Vec<u8> {
         &self.file_aad
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ColumnDecryptor {
+    data_decryptor: Arc<dyn BlockDecryptor>,
+    metadata_decryptor: Arc<dyn BlockDecryptor>,
+}
+
+impl PartialEq for ColumnDecryptor {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.data_decryptor, &other.data_decryptor)
+            && Arc::ptr_eq(&self.metadata_decryptor, &other.metadata_decryptor)
+    }
+}
+
+impl ColumnDecryptor {
+    pub(crate) fn new(
+        file_decryptor: &FileDecryptor,
+        column_crypto_metadata: &ColumnCryptoMetaData,
+    ) -> Result<Self> {
+        let (data_decryptor, metadata_decryptor) = match column_crypto_metadata {
+            ColumnCryptoMetaData::EncryptionWithFooterKey => {
+                // TODO: In GCM-CTR mode will this need to be a non-GCM decryptor?
+                let data_decryptor = file_decryptor.get_footer_decryptor()?;
+                let metadata_decryptor = file_decryptor.get_footer_decryptor()?;
+                (data_decryptor, metadata_decryptor)
+            }
+            ColumnCryptoMetaData::EncryptionWithColumnKey(column_key_encryption) => {
+                let key_metadata = &column_key_encryption.key_metadata;
+                let full_column_name;
+                let column_name = if column_key_encryption.path_in_schema.len() == 1 {
+                    &column_key_encryption.path_in_schema[0]
+                } else {
+                    full_column_name = column_key_encryption.path_in_schema.join(".");
+                    &full_column_name
+                };
+                let data_decryptor = file_decryptor
+                    .get_column_data_decryptor(column_name, key_metadata.as_deref())?;
+                let metadata_decryptor = file_decryptor
+                    .get_column_metadata_decryptor(column_name, key_metadata.as_deref())?;
+                (data_decryptor, metadata_decryptor)
+            }
+        };
+
+        Ok(Self {
+            data_decryptor,
+            metadata_decryptor,
+        })
+    }
+
+    pub(crate) fn data_decryptor(&self) -> Arc<dyn BlockDecryptor> {
+        self.data_decryptor.clone()
+    }
+
+    pub(crate) fn metadata_decryptor(&self) -> Arc<dyn BlockDecryptor> {
+        self.metadata_decryptor.clone()
     }
 }

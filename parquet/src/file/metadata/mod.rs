@@ -98,7 +98,7 @@ mod writer;
 use crate::basic::{ColumnOrder, Compression, Encoding, Type};
 #[cfg(feature = "encryption")]
 use crate::encryption::{
-    decrypt::FileDecryptor,
+    decrypt::{ColumnDecryptor, FileDecryptor},
     modules::{create_module_aad, ModuleType},
 };
 use crate::errors::{ParquetError, Result};
@@ -634,27 +634,22 @@ impl RowGroupMetaData {
             .zip(schema_descr.columns())
             .enumerate()
         {
-            // Read encrypted metadata if it's present and we have a decryptor.
-            if let (true, Some(decryptor)) = (c.encrypted_column_metadata.is_some(), decryptor) {
-                let column_decryptor = match c.crypto_metadata.as_ref() {
-                    None => {
-                        return Err(general_err!(
-                            "No crypto_metadata is set for column '{}', which has encrypted metadata",
-                            d.path().string()
-                        ));
-                    }
-                    Some(TColumnCryptoMetaData::ENCRYPTIONWITHCOLUMNKEY(crypto_metadata)) => {
-                        let column_name = crypto_metadata.path_in_schema.join(".");
-                        decryptor.get_column_metadata_decryptor(
-                            column_name.as_str(),
-                            crypto_metadata.key_metadata.as_deref(),
-                        )?
-                    }
-                    Some(TColumnCryptoMetaData::ENCRYPTIONWITHFOOTERKEY(_)) => {
-                        decryptor.get_footer_decryptor()?
-                    }
-                };
+            // Create a column decryptor if we have the necessary information.
+            let column_decryptor = if let (Some(file_decryptor), Some(crypto_metadata)) =
+                (decryptor, c.crypto_metadata.as_ref())
+            {
+                let crypto_metadata = column_crypto_metadata::try_from_thrift(crypto_metadata)?;
+                Some(ColumnDecryptor::new(file_decryptor, &crypto_metadata)?)
+            } else {
+                None
+            };
 
+            // Read encrypted metadata if it's present and we have a decryptor.
+            if let (true, Some(decryptor), Some(column_decryptor)) = (
+                c.encrypted_column_metadata.is_some(),
+                decryptor,
+                column_decryptor.as_ref(),
+            ) {
                 let column_aad = create_module_aad(
                     decryptor.file_aad(),
                     ModuleType::ColumnMetaData,
@@ -665,6 +660,7 @@ impl RowGroupMetaData {
 
                 let buf = c.encrypted_column_metadata.clone().unwrap();
                 let decrypted_cc_buf = column_decryptor
+                    .metadata_decryptor()
                     .decrypt(buf.as_slice(), column_aad.as_ref())
                     .map_err(|_| {
                         general_err!(
@@ -676,7 +672,9 @@ impl RowGroupMetaData {
                 let mut prot = TCompactSliceInputProtocol::new(decrypted_cc_buf.as_slice());
                 c.meta_data = Some(ColumnMetaData::read_from_in_protocol(&mut prot)?);
             }
-            columns.push(ColumnChunkMetaData::from_thrift(d.clone(), c)?);
+            let mut cm = ColumnChunkMetaData::from_thrift(d.clone(), c)?;
+            cm.with_column_decryptor(column_decryptor);
+            columns.push(cm);
         }
 
         let sorting_columns = rg.sorting_columns;
@@ -848,6 +846,8 @@ pub struct ColumnChunkMetaData {
     definition_level_histogram: Option<LevelHistogram>,
     #[cfg(feature = "encryption")]
     column_crypto_metadata: Option<ColumnCryptoMetaData>,
+    #[cfg(feature = "encryption")]
+    column_decryptor: Option<ColumnDecryptor>,
 }
 
 /// Histograms for repetition and definition levels.
@@ -1143,6 +1143,19 @@ impl ColumnChunkMetaData {
         self.column_crypto_metadata.as_ref()
     }
 
+    /// Returns the column decryptor for this column chunk.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn column_decryptor(&self) -> Option<&ColumnDecryptor> {
+        self.column_decryptor.as_ref()
+    }
+
+    /// Adds [`ColumnDecryptor`] to this column chunk instance to enable decryption of
+    /// encrypted data.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn with_column_decryptor(&mut self, decryptor: Option<ColumnDecryptor>) {
+        self.column_decryptor = decryptor;
+    }
+
     /// Method to convert from Thrift.
     pub fn from_thrift(column_descr: ColumnDescPtr, cc: ColumnChunk) -> Result<Self> {
         if cc.meta_data.is_none() {
@@ -1229,6 +1242,8 @@ impl ColumnChunkMetaData {
             definition_level_histogram,
             #[cfg(feature = "encryption")]
             column_crypto_metadata,
+            #[cfg(feature = "encryption")]
+            column_decryptor: None,
         };
         Ok(result)
     }
@@ -1367,6 +1382,8 @@ impl ColumnChunkMetaDataBuilder {
             definition_level_histogram: None,
             #[cfg(feature = "encryption")]
             column_crypto_metadata: None,
+            #[cfg(feature = "encryption")]
+            column_decryptor: None,
         })
     }
 
@@ -1971,7 +1988,7 @@ mod tests {
         #[cfg(not(feature = "encryption"))]
         let base_expected_size = 2312;
         #[cfg(feature = "encryption")]
-        let base_expected_size = 2648;
+        let base_expected_size = 2776;
 
         assert_eq!(parquet_meta.memory_size(), base_expected_size);
 
@@ -2001,7 +2018,7 @@ mod tests {
         #[cfg(not(feature = "encryption"))]
         let bigger_expected_size = 2816;
         #[cfg(feature = "encryption")]
-        let bigger_expected_size = 3152;
+        let bigger_expected_size = 3280;
 
         // more set fields means more memory usage
         assert!(bigger_expected_size > base_expected_size);
