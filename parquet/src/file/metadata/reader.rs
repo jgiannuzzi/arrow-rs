@@ -810,14 +810,17 @@ impl ParquetMetaDataReader {
             let meta = fetch
                 .fetch(metadata_start..(file_size - FOOTER_SIZE as u64))
                 .await?;
-            Ok((self.decode_footer_metadata(&meta, &footer)?, None))
+            Ok((
+                self.decode_footer_metadata_async(&meta, &footer).await?,
+                None,
+            ))
         } else {
             let metadata_start = (file_size - (length + FOOTER_SIZE) as u64 - footer_start)
                 .try_into()
                 .expect("metadata length should never be larger than u32");
             let slice = &suffix[metadata_start..suffix_len - FOOTER_SIZE];
             Ok((
-                self.decode_footer_metadata(slice, &footer)?,
+                self.decode_footer_metadata_async(slice, &footer).await?,
                 Some((footer_start as usize, suffix.slice(..metadata_start))),
             ))
         }
@@ -862,14 +865,15 @@ impl ParquetMetaDataReader {
 
             Ok((
                 // need to slice off the footer or decryption fails
-                self.decode_footer_metadata(&meta.slice(0..length), &footer)?,
+                self.decode_footer_metadata_async(&meta.slice(0..length), &footer)
+                    .await?,
                 None,
             ))
         } else {
             let metadata_start = suffix_len - metadata_offset;
             let slice = &suffix[metadata_start..suffix_len - FOOTER_SIZE];
             Ok((
-                self.decode_footer_metadata(slice, &footer)?,
+                self.decode_footer_metadata_async(slice, &footer).await?,
                 Some((0, suffix.slice(..metadata_start))),
             ))
         }
@@ -921,17 +925,18 @@ impl ParquetMetaDataReader {
     /// feature is enabled.
     ///
     /// [Parquet Spec]: https://github.com/apache/parquet-format#metadata
+    #[parquet_macros::generic_async]
     pub(crate) fn decode_footer_metadata(
         &self,
         buf: &[u8],
         footer_tail: &FooterTail,
     ) -> Result<ParquetMetaData> {
         #[cfg(feature = "encryption")]
-        let result = Self::decode_metadata_with_encryption(
+        let result = generic_async_call(Self::decode_metadata_with_encryption(
             buf,
             footer_tail.is_encrypted_footer(),
             self.file_decryption_properties.as_ref(),
-        );
+        ));
         #[cfg(not(feature = "encryption"))]
         let result = {
             if footer_tail.is_encrypted_footer() {
@@ -955,6 +960,7 @@ impl ParquetMetaDataReader {
     /// [Parquet Spec]: https://github.com/apache/parquet-format#metadata
     /// [Parquet Encryption Spec]: https://parquet.apache.org/docs/file-format/data-pages/encryption/
     #[cfg(feature = "encryption")]
+    #[parquet_macros::generic_async]
     fn decode_metadata_with_encryption(
         buf: &[u8],
         encrypted_footer: bool,
@@ -976,15 +982,15 @@ impl ParquetMetaDataReader {
                 .unwrap_or(false);
                 if supply_aad_prefix && file_decryption_properties.aad_prefix().is_none() {
                     return Err(general_err!(
-                        "Parquet file was encrypted with an AAD prefix that is not stored in the file, \
-                        but no AAD prefix was provided in the file decryption properties"
-                    ));
+                                    "Parquet file was encrypted with an AAD prefix that is not stored in the file, \
+                                    but no AAD prefix was provided in the file decryption properties"
+                                ));
                 }
-                let decryptor = get_file_decryptor(
+                let decryptor = generic_async_call(get_file_decryptor(
                     t_file_crypto_metadata.encryption_algorithm,
                     t_file_crypto_metadata.key_metadata.as_deref(),
                     file_decryption_properties,
-                )?;
+                ))?;
                 let footer_decryptor = decryptor.get_footer_decryptor();
                 let aad_footer = create_footer_aad(decryptor.file_aad())?;
 
@@ -999,7 +1005,9 @@ impl ParquetMetaDataReader {
 
                 file_decryptor = Some(decryptor);
             } else {
-                return Err(general_err!("Parquet file has an encrypted footer but decryption properties were not provided"));
+                return Err(general_err!(
+                "Parquet file has an encrypted footer but decryption properties were not provided"
+            ));
             }
         }
 
@@ -1013,11 +1021,11 @@ impl ParquetMetaDataReader {
             file_decryption_properties,
         ) {
             // File has a plaintext footer but encryption algorithm is set
-            let file_decryptor_value = get_file_decryptor(
+            let file_decryptor_value = generic_async_call(get_file_decryptor(
                 algo,
                 t_file_metadata.footer_signing_key_metadata.as_deref(),
                 file_decryption_properties,
-            )?;
+            ))?;
             if file_decryption_properties.check_plaintext_footer_integrity() && !encrypted_footer {
                 file_decryptor_value.verify_plaintext_footer_signature(buf)?;
             }
@@ -1026,11 +1034,11 @@ impl ParquetMetaDataReader {
 
         let mut row_groups = Vec::new();
         for rg in t_file_metadata.row_groups {
-            let r = RowGroupMetaData::from_encrypted_thrift(
+            let r = generic_async_call(RowGroupMetaData::from_encrypted_thrift(
                 schema_descr.clone(),
                 rg,
                 file_decryptor.as_ref(),
-            )?;
+            ))?;
             row_groups.push(r);
         }
         let column_orders =
@@ -1118,6 +1126,7 @@ impl ParquetMetaDataReader {
 }
 
 #[cfg(feature = "encryption")]
+#[parquet_macros::generic_async]
 fn get_file_decryptor(
     encryption_algorithm: EncryptionAlgorithm,
     footer_key_metadata: Option<&[u8]>,
@@ -1134,12 +1143,12 @@ fn get_file_decryptor(
                 algo.aad_prefix.unwrap_or_default()
             };
 
-            FileDecryptor::new(
+            generic_async_call(FileDecryptor::new(
                 file_decryption_properties,
                 footer_key_metadata,
                 aad_file_unique,
                 aad_prefix,
-            )
+            ))
         }
         EncryptionAlgorithm::AESGCMCTRV1(_) => Err(nyi_err!(
             "The AES_GCM_CTR_V1 encryption algorithm is not yet supported"

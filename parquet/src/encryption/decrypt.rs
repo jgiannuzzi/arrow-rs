@@ -21,6 +21,8 @@ use crate::encryption::ciphers::{BlockDecryptor, RingGcmBlockDecryptor, TAG_LEN}
 use crate::encryption::modules::{create_footer_aad, create_module_aad, ModuleType};
 use crate::errors::{ParquetError, Result};
 use crate::file::column_crypto_metadata::ColumnCryptoMetaData;
+#[cfg(feature = "async")]
+use futures::future::BoxFuture;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Formatter;
@@ -102,6 +104,18 @@ use std::sync::Arc;
 pub trait KeyRetriever: Send + Sync {
     /// Retrieve a decryption key given the key metadata
     fn retrieve_key(&self, key_metadata: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Trait for asynchronously retrieving an encryption key using the key's metadata
+///
+/// This is similar to [`KeyRetriever`], but the key retrieval operation is asynchronous.
+///
+/// Use it with [`FileDecryptionProperties::with_async_key_retriever`] to build
+/// decryption properties that can retrieve keys asynchronously.
+#[cfg(feature = "async")]
+pub trait AsyncKeyRetriever: Send + Sync {
+    /// Retrieve a decryption key given the key metadata
+    fn retrieve_key<'a>(&'a self, key_metadata: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>>;
 }
 
 pub(crate) fn read_and_decrypt<T: Read>(
@@ -251,6 +265,8 @@ struct ExplicitDecryptionKeys {
 enum DecryptionKeys {
     Explicit(ExplicitDecryptionKeys),
     ViaRetriever(Arc<dyn KeyRetriever>),
+    #[cfg(feature = "async")]
+    ViaAsyncRetriever(Arc<dyn AsyncKeyRetriever>),
 }
 
 impl PartialEq for DecryptionKeys {
@@ -261,6 +277,8 @@ impl PartialEq for DecryptionKeys {
                     && keys.column_keys == other_keys.column_keys
             }
             (DecryptionKeys::ViaRetriever(_), DecryptionKeys::ViaRetriever(_)) => true,
+            #[cfg(feature = "async")]
+            (DecryptionKeys::ViaAsyncRetriever(_), DecryptionKeys::ViaAsyncRetriever(_)) => true,
             _ => false,
         }
     }
@@ -325,6 +343,15 @@ impl FileDecryptionProperties {
         DecryptionPropertiesBuilderWithRetriever::new(key_retriever)
     }
 
+    /// Returns a new [`FileDecryptionProperties`] builder that uses a [`AsyncKeyRetriever`]
+    /// to get decryption keys based on key metadata.
+    #[cfg(feature = "async")]
+    pub fn with_async_key_retriever(
+        key_retriever: Arc<dyn AsyncKeyRetriever>,
+    ) -> DecryptionPropertiesBuilderWithAsyncRetriever {
+        DecryptionPropertiesBuilderWithAsyncRetriever::new(key_retriever)
+    }
+
     /// AAD prefix string uniquely identifies the file and prevents file swapping
     pub fn aad_prefix(&self) -> Option<&Vec<u8>> {
         self.aad_prefix.as_ref()
@@ -344,6 +371,25 @@ impl FileDecryptionProperties {
                 let key = retriever.retrieve_key(key_metadata.unwrap_or_default())?;
                 Ok(Cow::Owned(key))
             }
+            #[cfg(feature = "async")]
+            DecryptionKeys::ViaAsyncRetriever(_) => Err(general_err!(
+                "Cannot retrieve footer key using AsyncRetriever in sync context"
+            )),
+        }
+    }
+
+    /// Get the encryption key for decrypting a file's footer,
+    /// and also column data if uniform encryption is used.
+    #[cfg(feature = "async")]
+    pub async fn footer_key_async(&self, key_metadata: Option<&[u8]>) -> Result<Cow<'_, Vec<u8>>> {
+        match &self.keys {
+            DecryptionKeys::ViaAsyncRetriever(retriever) => {
+                let key = retriever
+                    .retrieve_key(key_metadata.unwrap_or_default())
+                    .await?;
+                Ok(Cow::Owned(key))
+            }
+            _ => self.footer_key(key_metadata),
         }
     }
 
@@ -365,6 +411,28 @@ impl FileDecryptionProperties {
                 let key = retriever.retrieve_key(key_metadata.unwrap_or_default())?;
                 Ok(Cow::Owned(key))
             }
+            #[cfg(feature = "async")]
+            DecryptionKeys::ViaAsyncRetriever(_) => Err(general_err!(
+                "Cannot retrieve column key using AsyncRetriever in sync context"
+            )),
+        }
+    }
+
+    /// Get the column-specific encryption key for decrypting column data and metadata within a file
+    #[cfg(feature = "async")]
+    pub async fn column_key_async(
+        &self,
+        column_name: &str,
+        key_metadata: Option<&[u8]>,
+    ) -> Result<Cow<'_, Vec<u8>>> {
+        match &self.keys {
+            DecryptionKeys::ViaAsyncRetriever(retriever) => {
+                let key = retriever
+                    .retrieve_key(key_metadata.unwrap_or_default())
+                    .await?;
+                Ok(Cow::Owned(key))
+            }
+            _ => self.column_key(column_name, key_metadata),
         }
     }
 
@@ -510,6 +578,56 @@ impl DecryptionPropertiesBuilderWithRetriever {
     }
 }
 
+/// Builder for [`FileDecryptionProperties`] that uses a [`AsyncKeyRetriever`]
+///
+/// See the [`AsyncKeyRetriever`] documentation for example usage.
+#[cfg(feature = "async")]
+pub struct DecryptionPropertiesBuilderWithAsyncRetriever {
+    key_retriever: Arc<dyn AsyncKeyRetriever>,
+    aad_prefix: Option<Vec<u8>>,
+    footer_signature_verification: bool,
+}
+
+#[cfg(feature = "async")]
+impl DecryptionPropertiesBuilderWithAsyncRetriever {
+    /// Create a new [`DecryptionPropertiesBuilderWithAsyncRetriever`] by providing a [`AsyncKeyRetriever`] that
+    /// can be used to get decryption keys based on key metadata.
+    pub fn new(
+        key_retriever: Arc<dyn AsyncKeyRetriever>,
+    ) -> DecryptionPropertiesBuilderWithAsyncRetriever {
+        Self {
+            key_retriever,
+            aad_prefix: None,
+            footer_signature_verification: true,
+        }
+    }
+
+    /// Finalize the builder and return created [`FileDecryptionProperties`]
+    pub fn build(self) -> Result<FileDecryptionProperties> {
+        let keys = DecryptionKeys::ViaAsyncRetriever(self.key_retriever);
+        Ok(FileDecryptionProperties {
+            keys,
+            aad_prefix: self.aad_prefix,
+            footer_signature_verification: self.footer_signature_verification,
+        })
+    }
+
+    /// Specify the expected AAD prefix to be used for decryption.
+    /// This must be set if the file was written with an AAD prefix and the
+    /// prefix is not stored in the file metadata.
+    pub fn with_aad_prefix(mut self, value: Vec<u8>) -> Self {
+        self.aad_prefix = Some(value);
+        self
+    }
+
+    /// Disable verification of footer tags for files that use plaintext footers.
+    /// Signature verification is enabled by default.
+    pub fn disable_footer_signature_verification(mut self) -> Self {
+        self.footer_signature_verification = false;
+        self
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FileDecryptor {
     decryption_properties: FileDecryptionProperties,
@@ -524,6 +642,7 @@ impl PartialEq for FileDecryptor {
 }
 
 impl FileDecryptor {
+    #[parquet_macros::generic_async]
     pub(crate) fn new(
         decryption_properties: &FileDecryptionProperties,
         footer_key_metadata: Option<&[u8]>,
@@ -531,7 +650,7 @@ impl FileDecryptor {
         aad_prefix: Vec<u8>,
     ) -> Result<Self> {
         let file_aad = [aad_prefix.as_slice(), aad_file_unique.as_slice()].concat();
-        let footer_key = decryption_properties.footer_key(footer_key_metadata)?;
+        let footer_key = generic_async_call(decryption_properties.footer_key(footer_key_metadata))?;
         let footer_decryptor = RingGcmBlockDecryptor::new(&footer_key).map_err(|e| {
             general_err!(
                 "Invalid footer key. {}",
@@ -569,24 +688,27 @@ impl FileDecryptor {
         Ok(())
     }
 
+    #[parquet_macros::generic_async]
     pub(crate) fn get_column_data_decryptor(
         &self,
         column_name: &str,
         key_metadata: Option<&[u8]>,
     ) -> Result<Arc<dyn BlockDecryptor>> {
-        let column_key = self
-            .decryption_properties
-            .column_key(column_name, key_metadata)?;
+        let column_key = generic_async_call(
+            self.decryption_properties
+                .column_key(column_name, key_metadata),
+        )?;
         Ok(Arc::new(RingGcmBlockDecryptor::new(&column_key)?))
     }
 
+    #[parquet_macros::generic_async]
     pub(crate) fn get_column_metadata_decryptor(
         &self,
         column_name: &str,
         key_metadata: Option<&[u8]>,
     ) -> Result<Arc<dyn BlockDecryptor>> {
         // Once GCM CTR mode is implemented, data and metadata decryptors may be different
-        self.get_column_data_decryptor(column_name, key_metadata)
+        generic_async_call(self.get_column_data_decryptor(column_name, key_metadata))
     }
 
     pub(crate) fn file_aad(&self) -> &Vec<u8> {
@@ -608,6 +730,7 @@ impl PartialEq for ColumnDecryptor {
 }
 
 impl ColumnDecryptor {
+    #[parquet_macros::generic_async]
     pub(crate) fn new(
         file_decryptor: &FileDecryptor,
         column_crypto_metadata: &ColumnCryptoMetaData,
@@ -628,10 +751,13 @@ impl ColumnDecryptor {
                     full_column_name = column_key_encryption.path_in_schema.join(".");
                     &full_column_name
                 };
-                let data_decryptor = file_decryptor
-                    .get_column_data_decryptor(column_name, key_metadata.as_deref())?;
-                let metadata_decryptor = file_decryptor
-                    .get_column_metadata_decryptor(column_name, key_metadata.as_deref())?;
+                let data_decryptor = generic_async_call(
+                    file_decryptor.get_column_data_decryptor(column_name, key_metadata.as_deref()),
+                )?;
+                let metadata_decryptor = generic_async_call(
+                    file_decryptor
+                        .get_column_metadata_decryptor(column_name, key_metadata.as_deref()),
+                )?;
                 (data_decryptor, metadata_decryptor)
             }
         };

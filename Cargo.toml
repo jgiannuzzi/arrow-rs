@@ -39,6 +39,7 @@ members = [
     "arrow-select",
     "arrow-string",
     "parquet",
+    "parquet/macros",
     "parquet-geospatial",
     "parquet-variant",
     "parquet-variant-compute",

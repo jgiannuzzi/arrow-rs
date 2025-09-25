@@ -23,6 +23,7 @@ use crate::encryption_util::{
 };
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
+use futures::future::{BoxFuture, FutureExt};
 use futures::TryStreamExt;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::arrow_writer::{
@@ -31,7 +32,7 @@ use parquet::arrow::arrow_writer::{
 };
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::{ArrowWriter, AsyncArrowWriter};
-use parquet::encryption::decrypt::FileDecryptionProperties;
+use parquet::encryption::decrypt::{AsyncKeyRetriever, FileDecryptionProperties, KeyRetriever};
 use parquet::encryption::encrypt::FileEncryptionProperties;
 use parquet::errors::ParquetError;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
@@ -393,6 +394,102 @@ async fn test_uniform_encryption_with_key_retriever() {
     verify_encryption_test_file_read_async(&mut file, decryption_properties)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_non_uniform_encryption_plaintext_footer_with_async_key_retriever() {
+    let testdata = arrow::util::test_util::parquet_test_data();
+    let path = format!("{testdata}/encrypt_columns_plaintext_footer.parquet.encrypted");
+    let mut file = File::open(&path).await.unwrap();
+
+    let key_retriever = TestAsyncKeyRetriever::new(Box::new(
+        TestKeyRetriever::new()
+            .with_key("kf".to_owned(), "0123456789012345".as_bytes().to_vec())
+            .with_key("kc1".to_owned(), "1234567890123450".as_bytes().to_vec())
+            .with_key("kc2".to_owned(), "1234567890123451".as_bytes().to_vec()),
+    ));
+
+    let decryption_properties =
+        FileDecryptionProperties::with_async_key_retriever(Arc::new(key_retriever))
+            .build()
+            .unwrap();
+
+    verify_encryption_test_file_read_async(&mut file, decryption_properties)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_non_uniform_encryption_with_async_key_retriever() {
+    let testdata = arrow::util::test_util::parquet_test_data();
+    let path = format!("{testdata}/encrypt_columns_and_footer.parquet.encrypted");
+    let mut file = File::open(&path).await.unwrap();
+
+    let key_retriever = TestAsyncKeyRetriever::new(Box::new(
+        TestKeyRetriever::new()
+            .with_key("kf".to_owned(), "0123456789012345".as_bytes().to_vec())
+            .with_key("kc1".to_owned(), "1234567890123450".as_bytes().to_vec())
+            .with_key("kc2".to_owned(), "1234567890123451".as_bytes().to_vec()),
+    ));
+
+    let decryption_properties =
+        FileDecryptionProperties::with_async_key_retriever(Arc::new(key_retriever))
+            .build()
+            .unwrap();
+
+    verify_encryption_test_file_read_async(&mut file, decryption_properties)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_uniform_encryption_with_async_key_retriever() {
+    let testdata = arrow::util::test_util::parquet_test_data();
+    let path = format!("{testdata}/uniform_encryption.parquet.encrypted");
+    let mut file = File::open(&path).await.unwrap();
+
+    let key_retriever = TestAsyncKeyRetriever::new(Box::new(
+        TestKeyRetriever::new().with_key("kf".to_owned(), "0123456789012345".as_bytes().to_vec()),
+    ));
+
+    let decryption_properties =
+        FileDecryptionProperties::with_async_key_retriever(Arc::new(key_retriever))
+            .build()
+            .unwrap();
+
+    verify_encryption_test_file_read_async(&mut file, decryption_properties)
+        .await
+        .unwrap();
+}
+
+#[test]
+fn test_async_key_retriever_in_sync_context() {
+    let test_data = arrow::util::test_util::parquet_test_data();
+    let path = format!("{test_data}/uniform_encryption.parquet.encrypted");
+    let file = std::fs::File::open(path).unwrap();
+
+    let key_retriever = TestAsyncKeyRetriever::new(Box::new(TestKeyRetriever::new()));
+
+    let decryption_properties =
+        FileDecryptionProperties::with_async_key_retriever(Arc::new(key_retriever))
+            .build()
+            .unwrap();
+
+    let options =
+        ArrowReaderOptions::default().with_file_decryption_properties(decryption_properties);
+    let metadata = ArrowReaderMetadata::load(&file, options);
+
+    match metadata {
+        Err(parquet::errors::ParquetError::General(s)) => {
+            assert_eq!(
+                s,
+                "Cannot retrieve footer key using AsyncRetriever in sync context"
+            );
+        }
+        _ => {
+            panic!("Expected ParquetError::General");
+        }
+    };
 }
 
 #[tokio::test]
@@ -923,4 +1020,25 @@ async fn test_multi_threaded_encrypted_writing_deprecated() {
         result.unwrap_err().to_string(),
         "Parquet error: Parquet file has an encrypted footer but decryption properties were not provided"
     );
+}
+
+/// An AsyncKeyRetriever to use in Parquet encryption tests,
+/// which just uses a synchronous KeyRetriever internally.
+pub struct TestAsyncKeyRetriever {
+    inner: Box<dyn KeyRetriever>,
+}
+
+impl TestAsyncKeyRetriever {
+    pub fn new(inner: Box<dyn KeyRetriever>) -> Self {
+        Self { inner }
+    }
+}
+
+impl AsyncKeyRetriever for TestAsyncKeyRetriever {
+    fn retrieve_key<'a>(
+        &'a self,
+        key_metadata: &'a [u8],
+    ) -> BoxFuture<'a, Result<Vec<u8>, ParquetError>> {
+        async move { self.inner.retrieve_key(key_metadata) }.boxed()
+    }
 }

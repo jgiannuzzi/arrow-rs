@@ -612,6 +612,7 @@ impl RowGroupMetaData {
 
     /// Method to convert from encrypted Thrift.
     #[cfg(feature = "encryption")]
+    #[parquet_macros::generic_async]
     fn from_encrypted_thrift(
         schema_descr: SchemaDescPtr,
         mut rg: RowGroup,
@@ -639,7 +640,10 @@ impl RowGroupMetaData {
                 (decryptor, c.crypto_metadata.as_ref())
             {
                 let crypto_metadata = column_crypto_metadata::try_from_thrift(crypto_metadata)?;
-                Some(ColumnDecryptor::new(file_decryptor, &crypto_metadata)?)
+                Some(generic_async_call(ColumnDecryptor::new(
+                    file_decryptor,
+                    &crypto_metadata,
+                ))?)
             } else {
                 None
             };
